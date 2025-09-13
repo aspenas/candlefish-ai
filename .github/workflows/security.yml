@@ -1,0 +1,358 @@
+name: Security & Compliance
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly security scan
+  workflow_dispatch:
+
+env:
+  SONARCLOUD_ORG: candlefish-ai
+  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+jobs:
+  # Dependency Scanning
+  dependency-scan:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/python@master
+        with:
+          args: --severity-threshold=high --all-projects
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'candlefish-ai'
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --enableExperimental
+            --failOnCVSS 7
+            --suppressionFiles .dependency-check-suppressions.xml
+
+      - name: Upload OWASP results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  # Code Security Analysis
+  code-analysis:
+    name: Code Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: python, javascript, typescript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/r2c-security-audit
+            p/django
+            p/flask
+            p/react
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONARCLOUD_ORG }}
+            -Dsonar.projectKey=candlefish-ai
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/*_test.go,**/vendor/**,**/node_modules/**
+            -Dsonar.tests=.
+            -Dsonar.test.inclusions=**/*_test.go,**/*.test.ts,**/*.test.js
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  # Secret Scanning
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect secrets with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Detect secrets with detect-secrets
+        run: |
+          pip install detect-secrets
+          detect-secrets scan --baseline .secrets.baseline
+          detect-secrets audit .secrets.baseline
+
+  # Container Security
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [clos, promoteros, paintbox, agents]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t candlefish-${{ matrix.image }}:scan \
+            -f docker/${{ matrix.image }}/Dockerfile .
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: candlefish-${{ matrix.image }}:scan
+          format: 'sarif'
+          output: 'trivy-${{ matrix.image }}.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-${{ matrix.image }}.sarif'
+
+      - name: Run Snyk container test
+        run: |
+          npm install -g snyk
+          snyk container test candlefish-${{ matrix.image }}:scan \
+            --severity-threshold=high \
+            --file=docker/${{ matrix.image }}/Dockerfile
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+
+      - name: Scan with Anchore
+        uses: anchore/scan-action@v3
+        with:
+          image: candlefish-${{ matrix.image }}:scan
+          fail-build: true
+          severity-cutoff: high
+
+  # Infrastructure Security
+  infrastructure-scan:
+    name: Infrastructure Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Terraform security scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false
+          format: sarif
+          out: tfsec-results.sarif
+
+      - name: Upload Terraform scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: tfsec-results.sarif
+
+      - name: Checkov Policy Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform,dockerfile,kubernetes,github_actions
+          output_format: sarif
+          output_file_path: checkov.sarif
+          download_external_modules: true
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: checkov.sarif
+
+  # Compliance Checks
+  compliance-check:
+    name: Compliance Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GDPR Compliance Check
+        run: |
+          # Check for PII handling
+          grep -r "email\|phone\|ssn\|credit_card" --include="*.py" --include="*.js" --include="*.ts" . || true
+          
+          # Verify data retention policies
+          if [ ! -f "docs/data-retention-policy.md" ]; then
+            echo "::warning::Data retention policy document not found"
+          fi
+
+      - name: SOC 2 Compliance Check
+        run: |
+          # Check for audit logging
+          grep -r "audit_log\|audit_trail" --include="*.py" . || echo "::warning::Audit logging not found"
+          
+          # Verify encryption at rest
+          grep -r "encrypt\|encryption" terraform/ || echo "::warning::Encryption configuration not found"
+
+      - name: PCI DSS Compliance Check
+        run: |
+          # Check for credit card handling
+          grep -r "credit_card\|card_number\|cvv" --include="*.py" --include="*.js" . || true
+          
+          # Verify secure transmission
+          grep -r "https\|tls\|ssl" terraform/ || echo "::warning::Secure transmission not configured"
+
+      - name: License Compliance
+        run: |
+          pip install pip-licenses
+          poetry run pip-licenses --format=csv --output-file=licenses-python.csv
+          
+          npx license-checker --production --csv --out=licenses-npm.csv
+          
+          # Check for copyleft licenses
+          if grep -i "gpl\|agpl" licenses-*.csv; then
+            echo "::error::Copyleft licenses detected"
+            exit 1
+          fi
+
+  # Security Report
+  security-report:
+    name: Generate Security Report
+    needs: [dependency-scan, code-analysis, secret-scan, container-scan, infrastructure-scan, compliance-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: security-artifacts/
+
+      - name: Generate consolidated report
+        run: |
+          cat > security-report.md <<EOF
+          # Security Scan Report
+          **Date**: $(date -u +%Y-%m-%d)
+          **Repository**: ${{ github.repository }}
+          **Branch**: ${{ github.ref_name }}
+          **Commit**: ${{ github.sha }}
+          
+          ## Summary
+          - Dependency Scan: ${{ needs.dependency-scan.result }}
+          - Code Analysis: ${{ needs.code-analysis.result }}
+          - Secret Scan: ${{ needs.secret-scan.result }}
+          - Container Scan: ${{ needs.container-scan.result }}
+          - Infrastructure Scan: ${{ needs.infrastructure-scan.result }}
+          - Compliance Check: ${{ needs.compliance-check.result }}
+          
+          ## Detailed Results
+          See attached artifacts for detailed scan results.
+          
+          ## Actions Required
+          1. Review and remediate any HIGH or CRITICAL vulnerabilities
+          2. Update dependencies with known security issues
+          3. Ensure all secrets are properly managed
+          4. Address any compliance violations
+          
+          ## Next Steps
+          - Review detailed reports in artifacts
+          - Create tickets for remediation
+          - Schedule security review meeting if critical issues found
+          EOF
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report
+          path: |
+            security-report.md
+            security-artifacts/
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+      - name: Create security issue if critical
+        if: |
+          needs.dependency-scan.result == 'failure' ||
+          needs.code-analysis.result == 'failure' ||
+          needs.secret-scan.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔒 Critical Security Issues Found - ${new Date().toISOString().split('T')[0]}`,
+              body: `Critical security issues were found in the automated security scan.
+              
+              **Workflow Run**: [View Details](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              
+              Please review the security report and address the issues immediately.`,
+              labels: ['security', 'critical', 'automated']
+            });
+            
+            console.log(`Created security issue #${issue.data.number}`);

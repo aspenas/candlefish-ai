@@ -1,0 +1,384 @@
+name: Monitoring & Alerting
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:
+    inputs:
+      alert_type:
+        description: 'Type of alert to test'
+        required: false
+        type: choice
+        options:
+          - all
+          - performance
+          - availability
+          - security
+          - cost
+
+env:
+  AWS_REGION: us-east-1
+  DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+  NEW_RELIC_API_KEY: ${{ secrets.NEW_RELIC_API_KEY }}
+  PAGERDUTY_TOKEN: ${{ secrets.PAGERDUTY_TOKEN }}
+
+jobs:
+  # System Health Monitoring
+  health-monitoring:
+    name: System Health Check
+    runs-on: ubuntu-latest
+    outputs:
+      health_status: ${{ steps.health.outputs.status }}
+      alerts: ${{ steps.health.outputs.alerts }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECS Services Health
+        id: ecs-health
+        run: |
+          UNHEALTHY_SERVICES=()
+          
+          for cluster in $(aws ecs list-clusters --query 'clusterArns[]' --output text); do
+            CLUSTER_NAME=$(echo $cluster | cut -d'/' -f2)
+            
+            for service in $(aws ecs list-services --cluster $CLUSTER_NAME --query 'serviceArns[]' --output text); do
+              SERVICE_NAME=$(echo $service | cut -d'/' -f3)
+              
+              RUNNING=$(aws ecs describe-services \
+                --cluster $CLUSTER_NAME \
+                --services $SERVICE_NAME \
+                --query 'services[0].runningCount' \
+                --output text)
+              
+              DESIRED=$(aws ecs describe-services \
+                --cluster $CLUSTER_NAME \
+                --services $SERVICE_NAME \
+                --query 'services[0].desiredCount' \
+                --output text)
+              
+              if [ "$RUNNING" -lt "$DESIRED" ]; then
+                UNHEALTHY_SERVICES+=("$CLUSTER_NAME/$SERVICE_NAME")
+              fi
+            done
+          done
+          
+          if [ ${#UNHEALTHY_SERVICES[@]} -gt 0 ]; then
+            echo "unhealthy_services=${UNHEALTHY_SERVICES[@]}" >> $GITHUB_OUTPUT
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+          else
+            echo "status=healthy" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Lambda Functions
+        id: lambda-health
+        run: |
+          FAILED_FUNCTIONS=()
+          
+          for function in $(aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `candlefish`)].[FunctionName]' --output text); do
+            ERROR_RATE=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/Lambda \
+              --metric-name Errors \
+              --dimensions Name=FunctionName,Value=$function \
+              --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+              --period 300 \
+              --statistics Sum \
+              --query 'Datapoints[0].Sum' \
+              --output text)
+            
+            if [ "$ERROR_RATE" != "None" ] && [ $(echo "$ERROR_RATE > 10" | bc) -eq 1 ]; then
+              FAILED_FUNCTIONS+=("$function")
+            fi
+          done
+          
+          if [ ${#FAILED_FUNCTIONS[@]} -gt 0 ]; then
+            echo "failed_functions=${FAILED_FUNCTIONS[@]}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RDS Health
+        id: rds-health
+        run: |
+          for db in $(aws rds describe-db-instances --query 'DBInstances[?contains(DBInstanceIdentifier, `candlefish`)].[DBInstanceIdentifier]' --output text); do
+            STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier $db \
+              --query 'DBInstances[0].DBInstanceStatus' \
+              --output text)
+            
+            if [ "$STATUS" != "available" ]; then
+              echo "rds_unhealthy=$db" >> $GITHUB_OUTPUT
+            fi
+            
+            # Check storage space
+            FREE_STORAGE=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/RDS \
+              --metric-name FreeStorageSpace \
+              --dimensions Name=DBInstanceIdentifier,Value=$db \
+              --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+              --period 300 \
+              --statistics Average \
+              --query 'Datapoints[0].Average' \
+              --output text)
+            
+            # Alert if less than 10GB free
+            if [ "$FREE_STORAGE" != "None" ] && [ $(echo "$FREE_STORAGE < 10737418240" | bc) -eq 1 ]; then
+              echo "rds_storage_low=$db" >> $GITHUB_OUTPUT
+            fi
+          done
+
+      - name: Generate Health Report
+        id: health
+        run: |
+          ALERTS=()
+          
+          if [ -n "${{ steps.ecs-health.outputs.unhealthy_services }}" ]; then
+            ALERTS+=("ECS Services unhealthy: ${{ steps.ecs-health.outputs.unhealthy_services }}")
+          fi
+          
+          if [ -n "${{ steps.lambda-health.outputs.failed_functions }}" ]; then
+            ALERTS+=("Lambda functions failing: ${{ steps.lambda-health.outputs.failed_functions }}")
+          fi
+          
+          if [ -n "${{ steps.rds-health.outputs.rds_unhealthy }}" ]; then
+            ALERTS+=("RDS instance unhealthy: ${{ steps.rds-health.outputs.rds_unhealthy }}")
+          fi
+          
+          if [ ${#ALERTS[@]} -gt 0 ]; then
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "alerts=${ALERTS[@]}" >> $GITHUB_OUTPUT
+          else
+            echo "status=healthy" >> $GITHUB_OUTPUT
+          fi
+
+  # Performance Monitoring
+  performance-monitoring:
+    name: Performance Monitoring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check API Response Times
+        run: |
+          # Get ALB target response times
+          for alb in $(aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName, `candlefish`)].[LoadBalancerArn]' --output text); do
+            AVG_RESPONSE_TIME=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/ApplicationELB \
+              --metric-name TargetResponseTime \
+              --dimensions Name=LoadBalancer,Value=$(echo $alb | cut -d':' -f6-) \
+              --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+              --period 300 \
+              --statistics Average \
+              --query 'Datapoints[0].Average' \
+              --output text)
+            
+            if [ "$AVG_RESPONSE_TIME" != "None" ] && [ $(echo "$AVG_RESPONSE_TIME > 1.0" | bc) -eq 1 ]; then
+              echo "::warning::High response time detected: ${AVG_RESPONSE_TIME}s"
+            fi
+          done
+
+      - name: Check CPU & Memory Usage
+        run: |
+          # Check ECS service CPU/Memory
+          for cluster in $(aws ecs list-clusters --query 'clusterArns[]' --output text); do
+            CLUSTER_NAME=$(echo $cluster | cut -d'/' -f2)
+            
+            CPU_UTIL=$(aws cloudwatch get-metric-statistics \
+              --namespace ECS/ContainerInsights \
+              --metric-name CpuUtilized \
+              --dimensions Name=ClusterName,Value=$CLUSTER_NAME \
+              --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+              --period 300 \
+              --statistics Average \
+              --query 'Datapoints[0].Average' \
+              --output text)
+            
+            if [ "$CPU_UTIL" != "None" ] && [ $(echo "$CPU_UTIL > 80" | bc) -eq 1 ]; then
+              echo "::warning::High CPU usage in cluster $CLUSTER_NAME: ${CPU_UTIL}%"
+            fi
+          done
+
+      - name: Send Performance Metrics to DataDog
+        if: env.DATADOG_API_KEY != ''
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/series" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ env.DATADOG_API_KEY }}" \
+            -d @- <<EOF
+          {
+            "series": [
+              {
+                "metric": "candlefish.deployment.health",
+                "points": [[$(date +%s), 1]],
+                "type": "gauge",
+                "tags": ["environment:production", "service:monitoring"]
+              }
+            ]
+          }
+          EOF
+
+  # Cost Monitoring
+  cost-monitoring:
+    name: AWS Cost Monitoring
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 8 * * *'  # Daily at 8 AM
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Cost and Usage
+        run: |
+          # Get yesterday's costs
+          START_DATE=$(date -u -d 'yesterday' +%Y-%m-%d)
+          END_DATE=$(date -u +%Y-%m-%d)
+          
+          DAILY_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics UnblendedCost \
+            --query 'ResultsByTime[0].Total.UnblendedCost.Amount' \
+            --output text)
+          
+          echo "Daily cost: \$$DAILY_COST"
+          
+          # Check if cost exceeds threshold
+          if [ $(echo "$DAILY_COST > 500" | bc) -eq 1 ]; then
+            echo "::warning::High daily cost detected: \$$DAILY_COST"
+          fi
+          
+          # Get cost by service
+          aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics UnblendedCost \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' \
+            --output table
+
+  # Alert Management
+  alert-management:
+    name: Alert Management
+    needs: [health-monitoring, performance-monitoring]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Process Alerts
+        id: process
+        run: |
+          if [ "${{ needs.health-monitoring.outputs.health_status }}" == "unhealthy" ]; then
+            echo "critical_alert=true" >> $GITHUB_OUTPUT
+            echo "alert_message=${{ needs.health-monitoring.outputs.alerts }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send PagerDuty Alert
+        if: steps.process.outputs.critical_alert == 'true'
+        run: |
+          curl -X POST https://events.pagerduty.com/v2/enqueue \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Token token=${{ env.PAGERDUTY_TOKEN }}" \
+            -d @- <<EOF
+          {
+            "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+            "event_action": "trigger",
+            "payload": {
+              "summary": "Candlefish Platform Alert",
+              "severity": "error",
+              "source": "GitHub Actions Monitoring",
+              "custom_details": {
+                "alerts": "${{ steps.process.outputs.alert_message }}",
+                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              }
+            }
+          }
+          EOF
+
+      - name: Send Slack Notification
+        if: steps.process.outputs.critical_alert == 'true'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚨 Candlefish Platform Alert",
+              attachments: [{
+                color: 'danger',
+                title: 'System Health Alert',
+                text: '${{ steps.process.outputs.alert_message }}',
+                fields: [
+                  { title: 'Environment', value: 'Production', short: true },
+                  { title: 'Time', value: '$(date -u +%Y-%m-%dT%H:%M:%SZ)', short: true }
+                ],
+                actions: [
+                  {
+                    type: 'button',
+                    text: 'View Details',
+                    url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+                  }
+                ]
+              }]
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Create GitHub Issue
+        if: steps.process.outputs.critical_alert == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Platform Alert: ${new Date().toISOString()}`,
+              body: `## Alert Details\n\n${process.env.alert_message}\n\n### Workflow Run\n[View Details](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              labels: ['alert', 'production', 'automated']
+            });
+            
+            console.log(`Created issue #${issue.data.number}`);
+
+  # Metrics Dashboard Update
+  update-dashboard:
+    name: Update Metrics Dashboard
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Metrics Report
+        run: |
+          cat > metrics-report.json <<EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "health_status": "${{ needs.health-monitoring.outputs.health_status }}",
+            "alerts": "${{ needs.health-monitoring.outputs.alerts }}",
+            "workflow_run": "${{ github.run_id }}"
+          }
+          EOF
+
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws s3 cp metrics-report.json s3://candlefish-metrics/reports/$(date +%Y%m%d-%H%M%S).json

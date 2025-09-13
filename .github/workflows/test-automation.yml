@@ -1,0 +1,429 @@
+name: Automated Testing Suite
+
+on:
+  push:
+    branches: [main, develop, 'feature/**']
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '20'
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # Python Testing
+  python-tests:
+    name: Python Tests - ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [clos, agents]
+        python: ['3.11', '3.12']
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For coverage comparison
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ~/.cache/pip
+            .venv
+          key: ${{ runner.os }}-poetry-${{ matrix.python }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry config virtualenvs.in-project true
+          poetry install --no-interaction --no-ansi --with dev,test
+
+      - name: Run linting
+        run: |
+          poetry run ruff check ${{ matrix.component }}/
+          poetry run black --check ${{ matrix.component }}/
+          poetry run mypy ${{ matrix.component }}/
+
+      - name: Run unit tests
+        env:
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          poetry run pytest ${{ matrix.component }}/tests/unit/ \
+            --cov=${{ matrix.component }} \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --junitxml=junit-${{ matrix.component }}.xml \
+            -v
+
+      - name: Run integration tests
+        if: matrix.python == '3.12'
+        env:
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          poetry run pytest ${{ matrix.component }}/tests/integration/ \
+            --cov=${{ matrix.component }} \
+            --cov-append \
+            --cov-report=xml \
+            -v
+
+      - name: Check coverage threshold
+        run: |
+          coverage_percentage=$(poetry run coverage report --skip-covered | grep TOTAL | awk '{print $4}' | sed 's/%//')
+          if (( $(echo "$coverage_percentage < $COVERAGE_THRESHOLD" | bc -l) )); then
+            echo "Coverage $coverage_percentage% is below threshold $COVERAGE_THRESHOLD%"
+            exit 1
+          fi
+          echo "Coverage $coverage_percentage% meets threshold"
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: ${{ matrix.component }}-python${{ matrix.python }}
+          name: ${{ matrix.component }}-py${{ matrix.python }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.component }}-py${{ matrix.python }}
+          path: |
+            junit-*.xml
+            htmlcov/
+            coverage.xml
+
+  # JavaScript/TypeScript Testing
+  javascript-tests:
+    name: JavaScript Tests - ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [promoteros, paintbox, brand]
+        node: ['18', '20']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            projects/${{ matrix.project }}/node_modules
+          key: ${{ runner.os }}-pnpm-${{ matrix.node }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        working-directory: projects/${{ matrix.project }}
+        run: |
+          pnpm install --frozen-lockfile
+
+      - name: Run linting
+        working-directory: projects/${{ matrix.project }}
+        run: |
+          pnpm run lint
+          pnpm run typecheck || true
+
+      - name: Run unit tests
+        working-directory: projects/${{ matrix.project }}
+        run: |
+          pnpm run test:unit -- --coverage --watchAll=false
+
+      - name: Run component tests
+        working-directory: projects/${{ matrix.project }}
+        run: |
+          pnpm run test:component -- --coverage --watchAll=false || true
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: projects/${{ matrix.project }}/coverage
+          flags: ${{ matrix.project }}-node${{ matrix.node }}
+
+  # E2E Testing
+  e2e-tests:
+    name: E2E Tests - ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, firefox, edge]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: e2epass
+          POSTGRES_DB: e2e_db
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Start services
+        run: |
+          # Start backend services
+          docker-compose -f docker-compose.test.yml up -d
+          
+          # Wait for services to be ready
+          ./scripts/wait-for-services.sh
+
+      - name: Run Cypress E2E tests
+        uses: cypress-io/github-action@v6
+        with:
+          browser: ${{ matrix.browser }}
+          record: true
+          parallel: true
+          group: E2E-${{ matrix.browser }}
+          config-file: cypress.config.ts
+          wait-on: 'http://localhost:3000, http://localhost:8000'
+          wait-on-timeout: 120
+        env:
+          CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload screenshots
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: cypress-screenshots-${{ matrix.browser }}
+          path: cypress/screenshots
+
+      - name: Upload videos
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: cypress-videos-${{ matrix.browser }}
+          path: cypress/videos
+
+  # Performance Testing
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up K6
+        run: |
+          curl https://github.com/grafana/k6/releases/download/v0.47.0/k6-v0.47.0-linux-amd64.tar.gz -L | tar xvz
+          sudo mv k6-v0.47.0-linux-amd64/k6 /usr/local/bin/
+
+      - name: Run load tests
+        run: |
+          k6 run tests/performance/load-test.js \
+            --out cloud \
+            --out json=results.json
+
+      - name: Run stress tests
+        run: |
+          k6 run tests/performance/stress-test.js \
+            --out cloud \
+            --out json=stress-results.json
+
+      - name: Analyze results
+        run: |
+          python scripts/analyze-performance.py results.json stress-results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: |
+            results.json
+            stress-results.json
+            performance-report.html
+
+  # Contract Testing
+  contract-tests:
+    name: Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Pact
+        run: |
+          npm install -g @pact-foundation/pact-node
+          npm install -g @pact-foundation/pact
+
+      - name: Run consumer tests
+        run: |
+          cd projects/promoteros
+          npm run test:pact:consumer
+
+      - name: Run provider tests
+        run: |
+          cd clos
+          poetry run pytest tests/pact/ -v
+
+      - name: Publish contracts
+        if: github.ref == 'refs/heads/main'
+        env:
+          PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+        run: |
+          pact-broker publish pacts \
+            --consumer-app-version=${{ github.sha }} \
+            --branch=${{ github.ref_name }}
+
+  # Mutation Testing
+  mutation-tests:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install --with dev,test
+          pip install mutmut
+
+      - name: Run mutation tests
+        run: |
+          mutmut run \
+            --paths-to-mutate=clos/ \
+            --tests-dir=clos/tests/ \
+            --runner="poetry run pytest" \
+            --use-coverage
+
+      - name: Generate report
+        run: |
+          mutmut html
+          mutmut results
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v3
+        with:
+          name: mutation-report
+          path: html/
+
+  # Test Results Summary
+  test-summary:
+    name: Test Results Summary
+    needs: [python-tests, javascript-tests, e2e-tests]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all test results
+        uses: actions/download-artifact@v3
+        with:
+          path: test-artifacts/
+
+      - name: Generate test report
+        run: |
+          python scripts/generate-test-report.py test-artifacts/ > test-report.md
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const testReport = fs.readFileSync('test-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: testReport
+            });
+
+      - name: Update status check
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha
+            });
+            
+            const testChecks = checks.check_runs.filter(check => 
+              check.name.includes('test') || check.name.includes('Test')
+            );
+            
+            const allPassed = testChecks.every(check => 
+              check.conclusion === 'success' || check.conclusion === 'skipped'
+            );
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: allPassed ? 'success' : 'failure',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: allPassed ? 'All tests passed' : 'Some tests failed',
+              context: 'Test Suite'
+            });

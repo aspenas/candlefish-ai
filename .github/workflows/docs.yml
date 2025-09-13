@@ -1,0 +1,527 @@
+name: Documentation Generation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'clos/**'
+      - 'agents/**'
+      - 'projects/**'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '20'
+
+jobs:
+  # Generate API Documentation
+  api-docs:
+    name: Generate API Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install documentation tools
+        run: |
+          # Python documentation tools
+          pip install sphinx sphinx-rtd-theme sphinx-autodoc-typehints
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+          pip install pydoc-markdown
+          
+          # TypeScript/JavaScript documentation tools
+          npm install -g typedoc @microsoft/api-extractor @microsoft/api-documenter
+          npm install -g jsdoc swagger-jsdoc
+
+      - name: Generate Python API docs
+        run: |
+          # Generate Sphinx documentation for CLOS
+          sphinx-quickstart -q -p "Candlefish CLOS" -a "Candlefish AI" -v "1.0" --ext-autodoc --ext-viewcode --makefile docs/sphinx
+          
+          cat > docs/sphinx/conf.py <<EOF
+          import os
+          import sys
+          sys.path.insert(0, os.path.abspath('../../'))
+          
+          project = 'Candlefish AI'
+          copyright = '2024, Candlefish AI'
+          author = 'Candlefish AI'
+          
+          extensions = [
+              'sphinx.ext.autodoc',
+              'sphinx.ext.napoleon',
+              'sphinx.ext.viewcode',
+              'sphinx.ext.githubpages',
+              'sphinx_autodoc_typehints',
+          ]
+          
+          templates_path = ['_templates']
+          exclude_patterns = []
+          
+          html_theme = 'sphinx_rtd_theme'
+          html_static_path = ['_static']
+          
+          autodoc_default_options = {
+              'members': True,
+              'member-order': 'bysource',
+              'special-members': '__init__',
+              'undoc-members': True,
+              'exclude-members': '__weakref__'
+          }
+          EOF
+          
+          # Generate API documentation
+          sphinx-apidoc -f -o docs/sphinx/api clos/
+          sphinx-apidoc -f -o docs/sphinx/api agents/
+          
+          # Build HTML documentation
+          sphinx-build -b html docs/sphinx docs/_build/sphinx
+
+      - name: Generate TypeScript API docs
+        run: |
+          # Generate TypeDoc for each project
+          for project in projects/*/; do
+            if [ -f "$project/tsconfig.json" ]; then
+              PROJECT_NAME=$(basename $project)
+              
+              # Create TypeDoc config
+              cat > $project/typedoc.json <<EOF
+          {
+            "entryPoints": ["src/index.ts"],
+            "out": "../../docs/_build/typedoc/$PROJECT_NAME",
+            "theme": "default",
+            "includeVersion": true,
+            "readme": "README.md",
+            "plugin": ["typedoc-plugin-markdown"],
+            "githubPages": true
+          }
+          EOF
+              
+              # Generate documentation
+              cd $project
+              npm install
+              npx typedoc
+              cd ../..
+            fi
+          done
+
+      - name: Generate OpenAPI specifications
+        run: |
+          # Generate OpenAPI docs for each service
+          python scripts/generate-openapi.py --service clos --output docs/openapi/clos.yaml
+          python scripts/generate-openapi.py --service promoteros --output docs/openapi/promoteros.yaml
+          
+          # Generate Swagger UI
+          npm install -g @apidevtools/swagger-cli
+          for spec in docs/openapi/*.yaml; do
+            swagger-cli bundle $spec -o $(basename $spec .yaml).json
+          done
+
+      - name: Upload API documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-docs
+          path: docs/_build/
+
+  # Generate Architecture Documentation
+  architecture-docs:
+    name: Generate Architecture Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Mermaid CLI
+        run: |
+          npm install -g @mermaid-js/mermaid-cli
+
+      - name: Generate architecture diagrams
+        run: |
+          mkdir -p docs/diagrams
+          
+          # System architecture
+          cat > docs/diagrams/system-architecture.mmd <<EOF
+          graph TB
+              subgraph "Client Layer"
+                  WEB[Web App]
+                  MOBILE[Mobile App]
+                  API_CLIENT[API Clients]
+              end
+              
+              subgraph "API Gateway"
+                  ALB[Application Load Balancer]
+                  CF[CloudFront CDN]
+              end
+              
+              subgraph "Application Layer"
+                  CLOS[CLOS Orchestrator]
+                  PROMOTER[PromoterOS API]
+                  PAINT[Paintbox Service]
+              end
+              
+              subgraph "Agent Layer"
+                  TICKET[Ticket Analyzer]
+                  VENUE[Venue Matcher]
+                  PRICE[Price Optimizer]
+                  SOCIAL[Social Analyzer]
+              end
+              
+              subgraph "Data Layer"
+                  RDS[(PostgreSQL)]
+                  REDIS[(Redis Cache)]
+                  S3[(S3 Storage)]
+                  DYNAMO[(DynamoDB)]
+              end
+              
+              subgraph "Infrastructure"
+                  ECS[ECS Fargate]
+                  LAMBDA[Lambda Functions]
+                  SQS[SQS Queues]
+                  SNS[SNS Topics]
+              end
+              
+              WEB --> CF
+              MOBILE --> CF
+              API_CLIENT --> ALB
+              CF --> ALB
+              ALB --> CLOS
+              ALB --> PROMOTER
+              ALB --> PAINT
+              CLOS --> TICKET
+              CLOS --> VENUE
+              CLOS --> PRICE
+              CLOS --> SOCIAL
+              PROMOTER --> RDS
+              PROMOTER --> REDIS
+              PAINT --> S3
+              CLOS --> DYNAMO
+              TICKET --> LAMBDA
+              VENUE --> LAMBDA
+              PRICE --> LAMBDA
+              SOCIAL --> LAMBDA
+              LAMBDA --> SQS
+              SQS --> SNS
+          EOF
+          
+          # Deployment architecture
+          cat > docs/diagrams/deployment-architecture.mmd <<EOF
+          graph LR
+              subgraph "Development"
+                  DEV_BRANCH[Feature Branch]
+                  DEV_TEST[Unit Tests]
+              end
+              
+              subgraph "CI/CD Pipeline"
+                  GH_ACTIONS[GitHub Actions]
+                  BUILD[Build & Test]
+                  SCAN[Security Scan]
+                  PACKAGE[Package]
+              end
+              
+              subgraph "Staging"
+                  STAGE_DEPLOY[Deploy to Staging]
+                  STAGE_TEST[Integration Tests]
+                  STAGE_APPROVE[Manual Approval]
+              end
+              
+              subgraph "Production"
+                  PROD_DEPLOY[Deploy to Production]
+                  PROD_VERIFY[Smoke Tests]
+                  PROD_MONITOR[Monitoring]
+              end
+              
+              DEV_BRANCH --> GH_ACTIONS
+              GH_ACTIONS --> BUILD
+              BUILD --> SCAN
+              SCAN --> PACKAGE
+              PACKAGE --> STAGE_DEPLOY
+              STAGE_DEPLOY --> STAGE_TEST
+              STAGE_TEST --> STAGE_APPROVE
+              STAGE_APPROVE --> PROD_DEPLOY
+              PROD_DEPLOY --> PROD_VERIFY
+              PROD_VERIFY --> PROD_MONITOR
+          EOF
+          
+          # Generate PNG diagrams
+          for diagram in docs/diagrams/*.mmd; do
+            mmdc -i $diagram -o ${diagram%.mmd}.png -t dark -b transparent
+            mmdc -i $diagram -o ${diagram%.mmd}.svg
+          done
+
+      - name: Generate PlantUML diagrams
+        run: |
+          # Install PlantUML
+          sudo apt-get update
+          sudo apt-get install -y plantuml
+          
+          # Create sequence diagrams
+          cat > docs/diagrams/request-flow.puml <<EOF
+          @startuml
+          !theme aws-orange
+          
+          participant "Client" as client
+          participant "CloudFront" as cf
+          participant "ALB" as alb
+          participant "CLOS" as clos
+          participant "Agent" as agent
+          participant "Database" as db
+          
+          client -> cf: HTTPS Request
+          cf -> cf: Check Cache
+          cf -> alb: Forward Request
+          alb -> clos: Route to Service
+          clos -> clos: Authenticate
+          clos -> agent: Process Request
+          agent -> db: Query Data
+          db -> agent: Return Data
+          agent -> clos: Process Result
+          clos -> alb: Return Response
+          alb -> cf: Forward Response
+          cf -> cf: Cache Response
+          cf -> client: HTTPS Response
+          
+          @enduml
+          EOF
+          
+          # Generate diagrams
+          plantuml -tpng docs/diagrams/*.puml
+
+      - name: Upload architecture documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: architecture-docs
+          path: docs/diagrams/
+
+  # Generate User Documentation
+  user-docs:
+    name: Generate User Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install documentation tools
+        run: |
+          npm install -g @docusaurus/init
+          npm install -g gitbook-cli
+
+      - name: Generate user guides
+        run: |
+          mkdir -p docs/guides
+          
+          # Create getting started guide
+          cat > docs/guides/getting-started.md <<EOF
+          # Getting Started with Candlefish AI
+          
+          ## Installation
+          
+          ### Using Docker
+          \`\`\`bash
+          docker-compose up -d
+          \`\`\`
+          
+          ### Using Kubernetes
+          \`\`\`bash
+          helm install candlefish ./helm/candlefish
+          \`\`\`
+          
+          ## Configuration
+          
+          ### Environment Variables
+          - \`DATABASE_URL\`: PostgreSQL connection string
+          - \`REDIS_URL\`: Redis connection string
+          - \`AWS_REGION\`: AWS region for services
+          
+          ## Quick Start
+          
+          1. Clone the repository
+          2. Configure environment variables
+          3. Run the setup script
+          4. Access the application
+          EOF
+          
+          # Create API guide
+          cat > docs/guides/api-guide.md <<EOF
+          # API Documentation
+          
+          ## Authentication
+          
+          All API requests require authentication using JWT tokens.
+          
+          ### Getting a Token
+          \`\`\`bash
+          curl -X POST https://api.candlefish.ai/auth/token \\
+            -H "Content-Type: application/json" \\
+            -d '{"username": "user", "password": "pass"}'
+          \`\`\`
+          
+          ## Endpoints
+          
+          ### CLOS Orchestrator
+          - \`GET /api/v1/orchestrator/status\`
+          - \`POST /api/v1/orchestrator/execute\`
+          
+          ### PromoterOS
+          - \`GET /api/v1/promoter/events\`
+          - \`POST /api/v1/promoter/bookings\`
+          EOF
+
+      - name: Build documentation site
+        run: |
+          # Install MkDocs
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+          
+          # Create MkDocs configuration
+          cat > mkdocs.yml <<EOF
+          site_name: Candlefish AI Documentation
+          site_url: https://docs.candlefish.ai
+          repo_url: https://github.com/candlefish-ai/candlefish-ai
+          
+          theme:
+            name: material
+            palette:
+              - scheme: default
+                primary: indigo
+                accent: indigo
+                toggle:
+                  icon: material/brightness-7
+                  name: Switch to dark mode
+              - scheme: slate
+                primary: indigo
+                accent: indigo
+                toggle:
+                  icon: material/brightness-4
+                  name: Switch to light mode
+            features:
+              - navigation.tabs
+              - navigation.sections
+              - navigation.expand
+              - search.suggest
+              - search.highlight
+              - content.code.copy
+          
+          nav:
+            - Home: index.md
+            - Getting Started:
+              - Installation: guides/getting-started.md
+              - Configuration: guides/configuration.md
+            - API Reference:
+              - Overview: api/overview.md
+              - Authentication: api/authentication.md
+              - Endpoints: api/endpoints.md
+            - Architecture:
+              - System Design: architecture/system.md
+              - Deployment: architecture/deployment.md
+            - Guides:
+              - User Guide: guides/user-guide.md
+              - Developer Guide: guides/developer-guide.md
+          
+          plugins:
+            - search
+            - mermaid2
+          
+          markdown_extensions:
+            - pymdownx.highlight
+            - pymdownx.superfences:
+                custom_fences:
+                  - name: mermaid
+                    class: mermaid
+                    format: !!python/name:pymdownx.superfences.fence_code_format
+            - pymdownx.tabbed
+            - admonition
+            - codehilite
+          EOF
+          
+          # Build documentation
+          mkdocs build -d docs/_site
+
+      - name: Upload user documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: user-docs
+          path: docs/_site/
+
+  # Deploy Documentation
+  deploy-docs:
+    name: Deploy Documentation
+    needs: [api-docs, architecture-docs, user-docs]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all documentation
+        uses: actions/download-artifact@v3
+        with:
+          path: docs-artifacts/
+
+      - name: Combine documentation
+        run: |
+          mkdir -p public
+          cp -r docs-artifacts/api-docs/* public/
+          cp -r docs-artifacts/architecture-docs/* public/
+          cp -r docs-artifacts/user-docs/* public/
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          cname: docs.candlefish.ai
+
+      - name: Deploy to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws s3 sync public/ s3://candlefish-docs/ --delete
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Update documentation index
+        run: |
+          cat > public/index.json <<EOF
+          {
+            "version": "$(git describe --tags --always)",
+            "generated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "sections": {
+              "api": "/api/",
+              "architecture": "/architecture/",
+              "guides": "/guides/",
+              "reference": "/reference/"
+            }
+          }
+          EOF
+          
+          aws s3 cp public/index.json s3://candlefish-docs/index.json
+
+      - name: Notify documentation update
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: Documentation updated and deployed
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <!-- Example suppression for known false positives -->
+    <!-- Add suppressions as needed for false positives in your dependencies -->
+    
+    <!-- Example: Suppress a specific CVE for a known false positive -->
+    <!--
+    <suppress>
+        <notes><![CDATA[
+        This suppresses a false positive CVE-XXXX-XXXX for example-package
+        ]]></notes>
+        <cve>CVE-XXXX-XXXX</cve>
+    </suppress>
+    -->
+    
+    <!-- Example: Suppress warnings for test dependencies -->
+    <!--
+    <suppress>
+        <notes><![CDATA[
+        Test dependencies are not used in production
+        ]]></notes>
+        <filePath regex="true">.*test.*</filePath>
+    </suppress>
+    -->
+</suppressions>

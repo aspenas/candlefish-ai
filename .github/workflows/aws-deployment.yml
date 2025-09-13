@@ -1,0 +1,476 @@
+name: AWS Deployment Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      service:
+        description: 'Service to deploy (all for everything)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - clos
+          - promoteros
+          - paintbox
+          - agents
+      action:
+        description: 'Deployment action'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - rollback
+          - scale
+          - restart
+  push:
+    branches:
+      - main
+      - staging
+    paths:
+      - 'terraform/**'
+      - 'k8s/**'
+      - 'docker/**'
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 681214184463
+  TF_VERSION: '1.6.0'
+  KUBECTL_VERSION: '1.28.0'
+  HELM_VERSION: '3.13.0'
+
+jobs:
+  # Infrastructure Provisioning
+  provision-infrastructure:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_name: ${{ steps.outputs.outputs.cluster_name }}
+      alb_dns: ${{ steps.outputs.outputs.alb_dns }}
+      rds_endpoint: ${{ steps.outputs.outputs.rds_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+        run: |
+          terraform init \
+            -backend-config="bucket=candlefish-terraform-state" \
+            -backend-config="key=${{ github.event.inputs.environment || 'staging' }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=candlefish-terraform-locks"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+        run: |
+          terraform plan \
+            -var="environment=${{ github.event.inputs.environment || 'staging' }}" \
+            -var="aws_account_id=${{ env.AWS_ACCOUNT_ID }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event.inputs.action != 'rollback'
+        working-directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+        run: |
+          terraform apply tfplan
+
+      - name: Get Terraform Outputs
+        id: outputs
+        working-directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+        run: |
+          echo "cluster_name=$(terraform output -raw eks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
+
+  # ECS Service Deployment
+  deploy-ecs-services:
+    name: Deploy ECS Services
+    needs: provision-infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service == 'all' || github.event.inputs.service == 'clos' || github.event.inputs.service == 'promoteros'
+    strategy:
+      matrix:
+        service: [clos-orchestrator, promoteros-api, promoteros-worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/candlefish-${{ matrix.service }}:$IMAGE_TAG \
+            -f docker/${{ matrix.service }}/Dockerfile .
+          docker push $ECR_REGISTRY/candlefish-${{ matrix.service }}:$IMAGE_TAG
+
+      - name: Deploy to ECS
+        run: |
+          # Register new task definition
+          aws ecs register-task-definition \
+            --family candlefish-${{ matrix.service }}-${{ github.event.inputs.environment || 'staging' }} \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "1024" \
+            --memory "2048" \
+            --execution-role-arn arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/candlefish-ecs-execution-role \
+            --task-role-arn arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/candlefish-ecs-task-role \
+            --container-definitions "[{
+              \"name\": \"${{ matrix.service }}\",
+              \"image\": \"${{ steps.login-ecr.outputs.registry }}/candlefish-${{ matrix.service }}:${{ github.sha }}\",
+              \"portMappings\": [{
+                \"containerPort\": 8000,
+                \"protocol\": \"tcp\"
+              }],
+              \"environment\": [
+                {\"name\": \"ENVIRONMENT\", \"value\": \"${{ github.event.inputs.environment || 'staging' }}\"},
+                {\"name\": \"AWS_REGION\", \"value\": \"${{ env.AWS_REGION }}\"},
+                {\"name\": \"NEW_RELIC_APP_NAME\", \"value\": \"candlefish-${{ matrix.service }}\"}
+              ],
+              \"secrets\": [
+                {\"name\": \"DATABASE_URL\", \"valueFrom\": \"arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:candlefish/database-url\"},
+                {\"name\": \"REDIS_URL\", \"valueFrom\": \"arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:candlefish/redis-url\"},
+                {\"name\": \"NEW_RELIC_LICENSE_KEY\", \"valueFrom\": \"arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:candlefish/newrelic-key\"}
+              ],
+              \"logConfiguration\": {
+                \"logDriver\": \"awslogs\",
+                \"options\": {
+                  \"awslogs-group\": \"/ecs/candlefish-${{ matrix.service }}\",
+                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                  \"awslogs-stream-prefix\": \"ecs\"
+                }
+              },
+              \"healthCheck\": {
+                \"command\": [\"CMD-SHELL\", \"curl -f http://localhost:8000/health || exit 1\"],
+                \"interval\": 30,
+                \"timeout\": 5,
+                \"retries\": 3,
+                \"startPeriod\": 60
+              }
+            }]"
+
+          # Update service with new task definition
+          aws ecs update-service \
+            --cluster candlefish-${{ github.event.inputs.environment || 'staging' }} \
+            --service ${{ matrix.service }} \
+            --task-definition candlefish-${{ matrix.service }}-${{ github.event.inputs.environment || 'staging' }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100,deploymentCircuitBreaker={enable=true,rollback=true}"
+
+          # Wait for service to stabilize
+          aws ecs wait services-stable \
+            --cluster candlefish-${{ github.event.inputs.environment || 'staging' }} \
+            --services ${{ matrix.service }}
+
+  # Lambda Functions Deployment
+  deploy-lambda-functions:
+    name: Deploy Lambda Functions
+    needs: provision-infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service == 'all' || github.event.inputs.service == 'agents'
+    strategy:
+      matrix:
+        function: [ticket-analyzer, venue-matcher, price-optimizer, social-analyzer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Package Lambda function
+        working-directory: agents/${{ matrix.function }}
+        run: |
+          pip install -r requirements.txt -t .
+          zip -r function.zip .
+
+      - name: Deploy Lambda function
+        run: |
+          # Create or update function
+          aws lambda create-function \
+            --function-name candlefish-${{ github.event.inputs.environment || 'staging' }}-${{ matrix.function }} \
+            --runtime python3.12 \
+            --role arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/candlefish-lambda-role \
+            --handler handler.main \
+            --zip-file fileb://agents/${{ matrix.function }}/function.zip \
+            --timeout 300 \
+            --memory-size 1024 \
+            --environment Variables="{
+              ENVIRONMENT=${{ github.event.inputs.environment || 'staging' }},
+              AWS_REGION=${{ env.AWS_REGION }}
+            }" \
+            --tags Environment=${{ github.event.inputs.environment || 'staging' }},Service=candlefish \
+            || aws lambda update-function-code \
+              --function-name candlefish-${{ github.event.inputs.environment || 'staging' }}-${{ matrix.function }} \
+              --zip-file fileb://agents/${{ matrix.function }}/function.zip
+
+          # Update function configuration
+          aws lambda update-function-configuration \
+            --function-name candlefish-${{ github.event.inputs.environment || 'staging' }}-${{ matrix.function }} \
+            --environment Variables="{
+              ENVIRONMENT=${{ github.event.inputs.environment || 'staging' }},
+              AWS_REGION=${{ env.AWS_REGION }},
+              DATABASE_SECRET_ARN=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:candlefish/database-url,
+              REDIS_SECRET_ARN=arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:candlefish/redis-url
+            }"
+
+          # Configure EventBridge triggers
+          aws events put-rule \
+            --name candlefish-${{ matrix.function }}-schedule \
+            --schedule-expression "rate(5 minutes)" \
+            --state ENABLED
+
+          aws lambda add-permission \
+            --function-name candlefish-${{ github.event.inputs.environment || 'staging' }}-${{ matrix.function }} \
+            --statement-id EventBridgeInvoke \
+            --action lambda:InvokeFunction \
+            --principal events.amazonaws.com \
+            --source-arn arn:aws:events:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:rule/candlefish-${{ matrix.function }}-schedule \
+            || true
+
+  # Kubernetes Deployment
+  deploy-kubernetes:
+    name: Deploy to EKS
+    needs: provision-infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service == 'all' || github.event.inputs.service == 'paintbox'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.provision-infrastructure.outputs.cluster_name }}
+
+      - name: Deploy with Helm
+        run: |
+          # Add Helm repositories
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+
+          # Deploy applications
+          helm upgrade --install candlefish-paintbox ./helm/paintbox \
+            --namespace candlefish \
+            --create-namespace \
+            --set environment=${{ github.event.inputs.environment || 'staging' }} \
+            --set image.tag=${{ github.sha }} \
+            --set ingress.host=${{ needs.provision-infrastructure.outputs.alb_dns }} \
+            --wait
+
+      - name: Deploy monitoring stack
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --values k8s/monitoring/prometheus-values.yaml \
+            --wait
+
+  # Database Migrations
+  run-migrations:
+    name: Run Database Migrations
+    needs: [provision-infrastructure, deploy-ecs-services]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get database credentials
+        id: db-creds
+        run: |
+          DB_SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id candlefish/database-url \
+            --query SecretString \
+            --output text)
+          echo "::add-mask::$DB_SECRET"
+          echo "DATABASE_URL=$DB_SECRET" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install --only main
+
+      - name: Run migrations
+        run: |
+          poetry run alembic upgrade head
+
+  # Post-deployment validation
+  validate-deployment:
+    name: Validate Deployment
+    needs: [deploy-ecs-services, deploy-lambda-functions, deploy-kubernetes]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Health checks
+        run: |
+          # Check ECS services
+          for service in clos-orchestrator promoteros-api promoteros-worker; do
+            STATUS=$(aws ecs describe-services \
+              --cluster candlefish-${{ github.event.inputs.environment || 'staging' }} \
+              --services $service \
+              --query 'services[0].runningCount' \
+              --output text)
+            
+            if [ "$STATUS" -eq "0" ]; then
+              echo "Service $service is not running!"
+              exit 1
+            fi
+          done
+
+          # Check Lambda functions
+          for function in ticket-analyzer venue-matcher price-optimizer social-analyzer; do
+            aws lambda invoke \
+              --function-name candlefish-${{ github.event.inputs.environment || 'staging' }}-$function \
+              --payload '{"test": true}' \
+              response.json
+            
+            if [ $? -ne 0 ]; then
+              echo "Lambda function $function failed to invoke!"
+              exit 1
+            fi
+          done
+
+      - name: Run smoke tests
+        run: |
+          npm install -g newman
+          newman run tests/postman/smoke-tests.json \
+            --environment tests/postman/${{ github.event.inputs.environment || 'staging' }}-env.json
+
+      - name: Update deployment status
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace Candlefish/Deployments \
+            --metric-name DeploymentSuccess \
+            --value 1 \
+            --dimensions Environment=${{ github.event.inputs.environment || 'staging' }},Version=${{ github.sha }}
+
+  # Rollback mechanism
+  rollback:
+    name: Rollback Deployment
+    needs: validate-deployment
+    if: failure() || github.event.inputs.action == 'rollback'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback ECS services
+        run: |
+          for service in clos-orchestrator promoteros-api promoteros-worker; do
+            # Get previous task definition
+            PREVIOUS_TASK_DEF=$(aws ecs describe-services \
+              --cluster candlefish-${{ github.event.inputs.environment || 'staging' }} \
+              --services $service \
+              --query 'services[0].deployments[1].taskDefinition' \
+              --output text)
+            
+            # Update service with previous task definition
+            aws ecs update-service \
+              --cluster candlefish-${{ github.event.inputs.environment || 'staging' }} \
+              --service $service \
+              --task-definition $PREVIOUS_TASK_DEF \
+              --force-new-deployment
+          done
+
+      - name: Notify rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "⚠️ Deployment rollback initiated",
+              attachments: [{
+                color: 'warning',
+                fields: [
+                  { title: 'Environment', value: '${{ github.event.inputs.environment || 'staging' }}', short: true },
+                  { title: 'Version', value: '${{ github.sha }}', short: true },
+                  { title: 'Triggered by', value: '${{ github.actor }}', short: true }
+                ]
+              }]
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}

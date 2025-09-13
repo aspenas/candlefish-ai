@@ -1,0 +1,401 @@
+name: Release Automation
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+      prerelease_tag:
+        description: 'Prerelease tag (alpha, beta, rc)'
+        required: false
+        default: 'beta'
+
+jobs:
+  # Semantic Release
+  semantic-release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+      new_release_notes: ${{ steps.semantic.outputs.new_release_notes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          npm install -g semantic-release @semantic-release/git @semantic-release/changelog @semantic-release/exec
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "candlefish-bot"
+          git config --global user.email "bot@candlefish.ai"
+
+      - name: Run semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npx semantic-release
+
+      - name: Get release info
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: |
+          echo "New version: ${{ steps.semantic.outputs.new_release_version }}"
+          echo "Release notes: ${{ steps.semantic.outputs.new_release_notes }}"
+
+  # Version Management
+  version-management:
+    name: Update Version Files
+    needs: semantic-release
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+          ref: main
+
+      - name: Update Python version
+        run: |
+          VERSION=${{ needs.semantic-release.outputs.new_release_version }}
+          sed -i "s/version = .*/version = \"$VERSION\"/" pyproject.toml
+          echo "__version__ = '$VERSION'" > clos/__version__.py
+
+      - name: Update package.json versions
+        run: |
+          VERSION=${{ needs.semantic-release.outputs.new_release_version }}
+          for pkg in projects/*/package.json; do
+            if [ -f "$pkg" ]; then
+              jq ".version = \"$VERSION\"" "$pkg" > tmp.json && mv tmp.json "$pkg"
+            fi
+          done
+
+      - name: Update Helm charts
+        run: |
+          VERSION=${{ needs.semantic-release.outputs.new_release_version }}
+          for chart in helm/*/Chart.yaml; do
+            if [ -f "$chart" ]; then
+              sed -i "s/^version: .*/version: $VERSION/" "$chart"
+              sed -i "s/^appVersion: .*/appVersion: $VERSION/" "$chart"
+            fi
+          done
+
+      - name: Commit version updates
+        run: |
+          git add -A
+          git commit -m "chore: update versions to ${{ needs.semantic-release.outputs.new_release_version }} [skip ci]"
+          git push
+
+  # Generate Release Assets
+  build-release-assets:
+    name: Build Release Assets
+    needs: [semantic-release, version-management]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [clos, promoteros, paintbox, agents]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Python packages
+        if: matrix.component == 'clos' || matrix.component == 'agents'
+        run: |
+          pip install poetry
+          poetry build
+          
+          # Create source distribution
+          tar -czf ${{ matrix.component }}-${{ needs.semantic-release.outputs.new_release_version }}.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            ${{ matrix.component }}/
+
+      - name: Build JavaScript packages
+        if: matrix.component == 'promoteros' || matrix.component == 'paintbox'
+        run: |
+          cd projects/${{ matrix.component }}
+          npm ci
+          npm run build
+          
+          # Create production bundle
+          tar -czf ../../${{ matrix.component }}-${{ needs.semantic-release.outputs.new_release_version }}.tar.gz \
+            --exclude='node_modules' \
+            --exclude='.env*' \
+            --exclude='*.log' \
+            .
+
+      - name: Build Docker images
+        run: |
+          docker build \
+            -t candlefish-${{ matrix.component }}:${{ needs.semantic-release.outputs.new_release_version }} \
+            -f docker/${{ matrix.component }}/Dockerfile \
+            .
+          
+          docker save candlefish-${{ matrix.component }}:${{ needs.semantic-release.outputs.new_release_version }} \
+            | gzip > ${{ matrix.component }}-docker-${{ needs.semantic-release.outputs.new_release_version }}.tar.gz
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-assets-${{ matrix.component }}
+          path: |
+            *.tar.gz
+            dist/
+
+  # Create GitHub Release
+  create-github-release:
+    name: Create GitHub Release
+    needs: [semantic-release, build-release-assets]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v3
+        with:
+          path: release-assets/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          cat > release-notes.md <<EOF
+          # Candlefish AI v${{ needs.semantic-release.outputs.new_release_version }}
+          
+          ## What's Changed
+          ${{ needs.semantic-release.outputs.new_release_notes }}
+          
+          ## Components
+          - **CLOS Orchestrator**: Core orchestration engine
+          - **PromoterOS**: Concert booking platform
+          - **Paintbox**: Creative AI tools
+          - **Agents**: AI agent implementations
+          
+          ## Docker Images
+          \`\`\`bash
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/candlefish-clos:${{ needs.semantic-release.outputs.new_release_version }}
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/candlefish-promoteros:${{ needs.semantic-release.outputs.new_release_version }}
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/candlefish-paintbox:${{ needs.semantic-release.outputs.new_release_version }}
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/candlefish-agents:${{ needs.semantic-release.outputs.new_release_version }}
+          \`\`\`
+          
+          ## Installation
+          \`\`\`bash
+          # Using Docker Compose
+          curl -L https://github.com/${{ github.repository }}/releases/download/v${{ needs.semantic-release.outputs.new_release_version }}/docker-compose.yml -o docker-compose.yml
+          docker-compose up -d
+          
+          # Using Helm
+          helm repo add candlefish https://charts.candlefish.ai
+          helm install candlefish candlefish/candlefish --version ${{ needs.semantic-release.outputs.new_release_version }}
+          \`\`\`
+          
+          ## Full Changelog
+          https://github.com/${{ github.repository }}/compare/v${{ needs.semantic-release.outputs.previous_version }}...v${{ needs.semantic-release.outputs.new_release_version }}
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.semantic-release.outputs.new_release_version }}
+          name: Release v${{ needs.semantic-release.outputs.new_release_version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(needs.semantic-release.outputs.new_release_version, '-') }}
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deploy Release
+  deploy-release:
+    name: Deploy Release
+    needs: [semantic-release, create-github-release]
+    if: needs.semantic-release.outputs.new_release_published == 'true' && !contains(needs.semantic-release.outputs.new_release_version, '-')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [staging, production]
+    environment:
+      name: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to ${{ matrix.environment }}
+        run: |
+          # Trigger deployment workflow
+          gh workflow run aws-deployment.yml \
+            -f environment=${{ matrix.environment }} \
+            -f service=all \
+            -f action=deploy \
+            -f version=${{ needs.semantic-release.outputs.new_release_version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for deployment
+        run: |
+          sleep 30
+          
+          # Monitor deployment status
+          DEPLOYMENT_ID=$(gh run list --workflow=aws-deployment.yml --limit=1 --json databaseId -q '.[0].databaseId')
+          
+          while true; do
+            STATUS=$(gh run view $DEPLOYMENT_ID --json status -q '.status')
+            if [ "$STATUS" = "completed" ]; then
+              CONCLUSION=$(gh run view $DEPLOYMENT_ID --json conclusion -q '.conclusion')
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "Deployment successful!"
+                break
+              else
+                echo "Deployment failed!"
+                exit 1
+              fi
+            fi
+            echo "Waiting for deployment to complete..."
+            sleep 30
+          done
+
+  # Update Documentation
+  update-docs:
+    name: Update Documentation
+    needs: [semantic-release]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install documentation tools
+        run: |
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+          pip install sphinx sphinx-rtd-theme
+
+      - name: Generate API documentation
+        run: |
+          # Generate Python API docs
+          sphinx-apidoc -o docs/api clos/
+          sphinx-build -b html docs/ docs/_build/
+
+          # Generate TypeScript API docs
+          npm install -g typedoc
+          for project in projects/*; do
+            if [ -f "$project/tsconfig.json" ]; then
+              typedoc --out docs/api/$(basename $project) $project/src
+            fi
+          done
+
+      - name: Update changelog
+        run: |
+          echo "# Changelog" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          gh release list --limit 10 | while read -r line; do
+            VERSION=$(echo $line | awk '{print $1}')
+            DATE=$(echo $line | awk '{print $3}')
+            echo "## $VERSION - $DATE" >> CHANGELOG.md
+            gh release view $VERSION --json body -q '.body' >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy documentation
+        run: |
+          mkdocs gh-deploy --force --clean --verbose
+
+  # Notify Release
+  notify-release:
+    name: Notify Release
+    needs: [semantic-release, deploy-release]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚀 New Candlefish AI Release",
+              attachments: [{
+                color: 'good',
+                title: 'Version ${{ needs.semantic-release.outputs.new_release_version }} Released',
+                fields: [
+                  { title: 'Version', value: '${{ needs.semantic-release.outputs.new_release_version }}', short: true },
+                  { title: 'Environment', value: 'Production', short: true },
+                  { title: 'Release Notes', value: '${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.semantic-release.outputs.new_release_version }}', short: false }
+                ],
+                footer: 'Candlefish AI',
+                footer_icon: 'https://candlefish.ai/favicon.ico',
+                ts: ${{ github.event.head_commit.timestamp }}
+              }]
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: Candlefish AI Release v${{ needs.semantic-release.outputs.new_release_version }}
+          to: team@candlefish.ai
+          from: releases@candlefish.ai
+          body: |
+            A new version of Candlefish AI has been released!
+            
+            Version: ${{ needs.semantic-release.outputs.new_release_version }}
+            
+            Release Notes:
+            ${{ needs.semantic-release.outputs.new_release_notes }}
+            
+            View full release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.semantic-release.outputs.new_release_version }}
